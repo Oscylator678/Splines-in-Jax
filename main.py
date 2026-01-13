@@ -249,11 +249,11 @@ def interp_3d(x, y, z):
     if normal_order:
         x_grid, y_grid = jnp.meshgrid(xx, yy)
         spline = Spline2D(xx,yy)
-        spline.fit(x_grid, y_grid, z, regularization=1e-12)
+        spline.fit_large_grid(x_grid, y_grid, z, regularization=1e-12)
     else:
         x_grid, y_grid = jnp.meshgrid(xx, yy)
         spline = Spline2D(yy, xx)
-        spline.fit(y_grid, x_grid, z, regularization=1e-12)
+        spline.fit_large_grid(y_grid, x_grid, z, regularization=1e-12)
     return(spline.predict)
 
 

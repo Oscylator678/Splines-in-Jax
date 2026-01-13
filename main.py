@@ -1,17 +1,22 @@
+from doctest import debug
+
 import jax
 import jax.numpy as jnp
 from jax import grad, vmap, jit
 from functools import partial
+from jax.scipy.sparse.linalg import cg
+from jax.experimental import sparse
 
 # def main():
 #     print("Hello from splines-in-jax!")
 
 class Spline2D:
-    def __init__(self, x_knots, y_knots, coefficients=None, degree=3):
+    def __init__(self, x_knots, y_knots, coefficients=None, degree=3, debug=False):
         self.degree = degree
         self.x_knots = jnp.array(x_knots)
         self.y_knots = jnp.array(y_knots)
         self.coeffs = coefficients
+        self.debug = debug
 
     @staticmethod
     def _bspline_basis(x, k, knots, degree):
@@ -59,6 +64,85 @@ class Spline2D:
         return jnp.einsum('ij,i,j->', coeffs, bx, by)
 
 
+    def fit_large_grid(self, x, y, z, regularization=1e-10):
+        """
+        Memory-efficient fit for large grids (e.g., 100x500).
+        Uses Matrix-Free Conjugate Gradient.
+        """
+
+        # 1. Setup
+        x = jnp.ravel(x)
+        y = jnp.ravel(y)
+        z = jnp.ravel(z)
+        N = len(x)
+
+        deg = self.degree
+        n_bx = len(self.x_knots) - deg - 1
+        n_by = len(self.y_knots) - deg - 1
+        M = n_bx * n_by
+        if self.debug:
+            print(f"Problem Size: Data(N)={N}, Coeffs(M)={M}")
+
+        # 2. Local Support Lookup (The fast part)
+        idx_x = jnp.clip(jnp.searchsorted(self.x_knots, x, side='right') - 1, deg, n_bx - 1)
+        idx_y = jnp.clip(jnp.searchsorted(self.y_knots, y, side='right') - 1, deg, n_by - 1)
+        if self.debug:
+            print(f'number of x knots {len(self.x_knots)}, number of y knots {len(self.y_knots)}, z shape is {jnp.shape(z)}')
+            print(f'number of x basis{n_bx}, number of y basis{n_by}.')
+        def get_active_basis(val, knot_idx, knots):
+            active_indices = knot_idx - jnp.arange(deg, -1, -1)
+            results = vmap(lambda k: self._bspline_basis(val, k, knots, deg))(active_indices)
+            return results, active_indices
+
+        bx_vals, bx_inds = vmap(lambda v, i: get_active_basis(v, i, self.x_knots))(x, idx_x)
+        by_vals, by_inds = vmap(lambda v, i: get_active_basis(v, i, self.y_knots))(y, idx_y)
+
+        # 3. Build Sparse Operator
+        def compute_triplets(b_x, b_y, idx_x, idx_y):
+            # Outer product of basis values (4x4 = 16 values)
+            w_block = jnp.outer(b_x, b_y).flatten()
+
+            # Global Indices
+            iy_grid, ix_grid = jnp.meshgrid(idx_y, idx_x, indexing='ij')
+            global_indices = iy_grid * n_bx + ix_grid
+            return global_indices.flatten(), w_block
+
+        all_indices, all_weights = vmap(compute_triplets)(bx_vals, by_vals, bx_inds, by_inds)
+
+        # Create lightweight Sparse Matrix (Holds ~800k floats, not billions)
+        row_indices = jnp.repeat(jnp.arange(N), (deg+1)**2)
+        A_sparse = sparse.BCOO(
+            (all_weights.flatten(), jnp.column_stack((row_indices, all_indices.flatten()))),
+            shape=(N, M)
+        )
+
+        # 4. Matrix-Free Solver Logic
+        # We need to solve: (A.T @ A + reg*I) x = A.T @ z
+        # We define a function that calculates the Left Hand Side on the fly
+
+        def matvec(v):
+            # v shape: (M,)
+            # Step 1: Project to Data Space (Size N)
+            Av = A_sparse @ v
+            # Step 2: Project back to Coeff Space (Size M)
+            AtAv = A_sparse.T @ Av
+            # Step 3: Regularization
+            return AtAv + regularization * v
+        if self.debug:
+            print(f"A_sparse shape: {A_sparse.shape}")
+        # Compute Right Hand Side
+        b_vector = A_sparse.T @ z
+        if self.debug:
+            print(f"b_vector shape: {b_vector.shape}")
+
+        # 5. Solve
+        print("Starting solver (this may take a moment)...")
+        # Use a higher maxiter because Interpolation (N approx M) is harder than Fitting (N >> M)
+        coeffs_flat, info = cg(matvec, b_vector, maxiter=5000, tol=1e-6)
+
+        self.coeffs = coeffs_flat.reshape(n_bx, n_by)
+        if self.debug:
+            print(f"Done. Solution shape: {self.coeffs.shape}")
     def fit_fast(self, x, y, z, regularization=1e-6):
         """
         Optimized fit using Local Support logic.
@@ -80,6 +164,9 @@ class Spline2D:
         # (This handles points exactly on the boundary)
         idx_x = jnp.clip(jnp.searchsorted(self.x_knots, x, side='right') - 1, deg, n_bx - 1)
         idx_y = jnp.clip(jnp.searchsorted(self.y_knots, y, side='right') - 1, deg, n_by - 1)
+        if self.debug:
+            print(f'number of x knots {len(self.x_knots)}, number of y knots {len(self.y_knots)}, z shape is {jnp.shape(z)}')
+            print(f'number of x basis{n_bx}, number of y basis{n_by}.')
 
         # 3. Compute ONLY the active basis functions (Non-Zero)
         # For a cubic spline, we only care about 'deg+1' bases ending at idx
@@ -148,8 +235,6 @@ class Spline2D:
         # If N is large but M is manageable, we can just construct A sparsely?
         # JAX BCOO is good for this.
 
-        from jax.experimental import sparse
-
         # Coordinates for the sparse design matrix A
         # Rows: 0..N (repeated 16 times per point)
         # Cols: all_indices
@@ -168,6 +253,8 @@ class Spline2D:
             shape=(N, M)
         )
 
+        if self.debug:
+            print(f"A_sparse shape: {A_sparse.shape}")
         # Compute LHS = A.T @ A + reg*I
         # Sparse matrix multiplication is memory efficient
         lhs = (A_sparse.T @ A_sparse).todense()  # Result is M x M (small)
@@ -181,7 +268,8 @@ class Spline2D:
         # 6. Solve
         coeffs_flat = jnp.linalg.solve(lhs, rhs)
         self.coeffs = coeffs_flat.reshape(n_bx, n_by)
-        print(f"Fast Fit complete. Coeffs shape: {self.coeffs.shape}")
+        if self.debug:
+            print(f"Fast Fit complete. Coeffs shape: {self.coeffs.shape}")
 
 
     def fit(self, x, y, z, regularization=1e-6):
@@ -191,7 +279,9 @@ class Spline2D:
 
         n_basis_x = len(self.x_knots) - self.degree - 1
         n_basis_y = len(self.y_knots) - self.degree - 1
-
+        if self.debug:
+            print(f'number of x knots {len(self.x_knots)}, number of y knots {len(self.y_knots)}, z shape is {jnp.shape(z)}')
+            print(f'number of x basis{n_basis_x}, number of y basis{n_basis_y}.')
         def build_row(xi, yi):
             # We must pass self.degree here. Since this helper is inside 'fit' (Python side),
             # it will unroll correctly when passed to vmap.
@@ -200,13 +290,15 @@ class Spline2D:
             return jnp.outer(bx, by).flatten()
 
         A = vmap(build_row)(x, y)
-
+        if self.debug:
+            print(f"A shape: {A.shape}")
         lhs = A.T @ A + regularization * jnp.eye(A.shape[1])
         rhs = A.T @ z
 
         coeffs_flat = jnp.linalg.solve(lhs, rhs)
         self.coeffs = coeffs_flat.reshape(n_basis_x, n_basis_y)
-        print(f"Fit complete. Coeffs shape: {self.coeffs.shape}")
+        if self.debug:
+            print(f"Fit complete. Coeffs shape: {self.coeffs.shape}")
 
 
     def predict(self, x, y):
@@ -236,7 +328,7 @@ class Spline2D:
         return d_fn(x, y)
 
 
-def interp_3d(x, y, z):
+def interp_3d(x, y, z, fast=True, large=True):
     xx = jnp.ravel(x)
     yy = jnp.ravel(y)
     if z.shape == (xx.shape[0],yy.shape[0]):
@@ -249,11 +341,17 @@ def interp_3d(x, y, z):
     if normal_order:
         x_grid, y_grid = jnp.meshgrid(xx, yy)
         spline = Spline2D(xx,yy)
-        spline.fit_large_grid(x_grid, y_grid, z, regularization=1e-12)
+        if fast:
+            spline.fit_large_grid(x_grid, y_grid, z, regularization=1e-12)
+            if large:
+                spline.fit_fast(x_grid, y_grid, z, regularization=1e-12)
     else:
         x_grid, y_grid = jnp.meshgrid(xx, yy)
         spline = Spline2D(yy, xx)
-        spline.fit_large_grid(y_grid, x_grid, z, regularization=1e-12)
+        if fast:
+            spline.fit_large_grid(y_grid, x_grid, z, regularization=1e-12)
+            if large:
+                spline.fit_fast(y_grid, x_grid, z, regularization=1e-12)
     return(spline.predict)
 
 

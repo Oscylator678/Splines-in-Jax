@@ -1,9 +1,8 @@
 import jax.numpy as jnp
-from jax import jit, vmap
+from jax import jit, vmap, grad
 from functools import partial
 from jax.experimental import sparse
 from jax.scipy.sparse.linalg import cg
-
 
 @staticmethod
 def _bspline_basis(x, k, knots, degree):
@@ -25,8 +24,89 @@ def _bspline_basis(x, k, knots, degree):
     return term1 + term2
 
 
+
+#Penalized B-Splines
 @partial(jit, static_argnums=(5, 6))
-def _fit_solver_kernel(x, y, z, x_knots, y_knots, degree, maxiter, regularization):
+def _fit_solver_kernel_penalized(x, y, z, x_knots, y_knots, degree, maxiter, regularization):
+    x = jnp.ravel(x)
+    y = jnp.ravel(y)
+    z = jnp.ravel(z)
+
+    N = x.shape[0]
+    n_bx = x_knots.shape[0] - degree - 1
+    n_by = y_knots.shape[0] - degree - 1
+    M = n_bx * n_by
+
+    # 1. Local Support Lookup
+    idx_x = jnp.clip(jnp.searchsorted(x_knots, x, side='right') - 1, degree, n_bx - 1)
+    idx_y = jnp.clip(jnp.searchsorted(y_knots, y, side='right') - 1, degree, n_by - 1)
+
+    # (Helper function inside to ensure scope visibility)
+    def get_active_basis(val, knot_idx, knots):
+        active_indices = knot_idx - jnp.arange(degree, -1, -1)
+        # Assuming _bspline_basis is available in scope or imported
+        results = vmap(lambda k: _bspline_basis(val, k, knots, degree))(active_indices)
+
+        is_end = jnp.isclose(val, knots[-1], atol=1e-10)
+        end_mask = jnp.arange(degree + 1) == degree
+        results = jnp.where(is_end, jnp.where(end_mask, 1.0, 0.0), results)
+        return results, active_indices
+
+    bx_vals, bx_inds = vmap(lambda v, i: get_active_basis(v, i, x_knots))(x, idx_x)
+    by_vals, by_inds = vmap(lambda v, i: get_active_basis(v, i, y_knots))(y, idx_y)
+
+    # 2. Build Sparse Matrix
+    def compute_triplets(b_x, b_y, idx_x, idx_y):
+        w_block = jnp.outer(b_y, b_x).flatten()
+        iy_grid, ix_grid = jnp.meshgrid(idx_y, idx_x, indexing='ij')
+        global_indices = iy_grid * n_bx + ix_grid
+        return global_indices.flatten(), w_block
+
+    all_indices, all_weights = vmap(compute_triplets)(bx_vals, by_vals, bx_inds, by_inds)
+
+    row_indices = jnp.repeat(jnp.arange(N), (degree + 1) ** 2)
+    A_sparse = sparse.BCOO(
+        (all_weights.flatten(), jnp.column_stack((row_indices, all_indices.flatten()))),
+        shape=(N, M)
+    )
+
+    # --- THE FIX: P-Spline Regularization ---
+    # Define a function that computes the "roughness" of the surface
+    def roughness_penalty(c_flat):
+        # Reshape to grid (n_by rows, n_bx cols)
+        c_grid = c_flat.reshape(n_by, n_bx)
+
+        # Discrete 2nd derivative (D^T D equivalent)
+        # This penalizes (c[i+1] - 2c[i] + c[i-1])^2
+        diff_y = jnp.diff(c_grid, n=2, axis=0)  # Smoothness along Y
+        diff_x = jnp.diff(c_grid, n=2, axis=1)  # Smoothness along X
+
+        # P-Spline Objective: lambda * (||D_y c||^2 + ||D_x c||^2)
+        return 0.5 * regularization * (jnp.sum(diff_y ** 2) + jnp.sum(diff_x ** 2))
+
+    # JAX automatically computes the gradient vector (P @ c) for us!
+    penalty_grad_fn = grad(roughness_penalty)
+
+    def matvec(v):
+        # A.T @ A @ v
+        Av = A_sparse @ v
+        AtAv = A_sparse.T @ Av
+
+        # Add Smoothness Penalty gradient
+        # This adds the term (lambda * D.T @ D) @ v
+        Pv = penalty_grad_fn(v)
+
+        # Small ridge for absolute numerical stability
+        return AtAv + Pv + 1e-14 * v
+
+    b_vector = A_sparse.T @ z
+    coeffs_flat, info = cg(matvec, b_vector, maxiter=maxiter, tol=1e-10)
+
+    return coeffs_flat.reshape(n_by, n_bx).T
+
+#B-spline with ridge regression fitting
+@partial(jit, static_argnums=(5, 6))
+def _fit_solver_kernel_ridge(x, y, z, x_knots, y_knots, degree, maxiter, regularization):
     x = jnp.ravel(x)
     y = jnp.ravel(y)
     z = jnp.ravel(z)
@@ -91,7 +171,13 @@ def _fit_solver_kernel(x, y, z, x_knots, y_knots, degree, maxiter, regularizatio
     # Reshape to (n_by, n_bx) then transpose to (n_bx, n_by) for consistency with 'ij' indexing
     return coeffs_flat.reshape(n_by, n_bx).T
 
-
+def _fit_solver_kernel(x, y, z, x_knots, y_knots, degree, maxiter=500, regularization=1e-4, method='penalized'):
+    if method in ['penalized', 'pen', 'Pspline', 'P-spline']:
+        return _fit_solver_kernel_penalized(x, y, z, x_knots, y_knots, degree, maxiter, regularization)
+    elif method in ['ridge', 'rig', 'Ridge', 'shink coeff']:
+        return _fit_solver_kernel_ridge(x, y, z, x_knots, y_knots, degree, maxiter, regularization)
+    else:
+        raise ValueError(f'Unknown method {method} requested for bivariate spline. Choose either penalized or ridge.')
 @partial(jit, static_argnums=(5,))
 def _evaluate_single(x, y, coeffs, x_knots, y_knots, degree):
     # Optimized prediction using the same "active basis" logic as fit
@@ -171,6 +257,8 @@ def bivariate_spline_interp(z, x_knots, y_knots, degree=3, maxiter=5000, regular
     predict_fn = vmap(lambda x, y: _evaluate_single(x, y, coeffs, x_spline_knots, y_spline_knots, degree))
 
     return predict_fn
+
+
 
 def main():
     degree = 3
